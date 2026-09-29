@@ -14,6 +14,9 @@
 #   allele_flipped, ambiguous, freq_mismatch, freq_residual, pos_shift,
 #   n_gwas_matches
 #
+# pos_shift is NUMERIC (signed base pairs, 0 unless the window rung fired), so
+# select shifted rows with `pos_shift != 0` rather than treating it as a flag.
+#
 # match_method records which rung of the matching ladder resolved the row:
 #   "exact" (verbatim alleles match at the exact position),
 #   "trimmed" (parsimonious indel representations agree at the exact position),
@@ -50,49 +53,61 @@ annotate_pgs_with_gwas <- function(pgs, gwas,
   out <- pgs
 
   # Pass through any other GWAS columns (se, pvalue, n, rsid, ...) verbatim;
-  # these aren't orientation-dependent so no flip is applicable. They are
-  # assigned before the columns below so that a GWAS column whose name collides
-  # after prefixing (e.g., a GWAS column named "position_matched") cannot
-  # overwrite this function's own QC output.
+  # these aren't orientation-dependent so no flip is applicable.
   extra_cols <- setdiff(names(gwas), c(.VM_REQ_COLS, "beta"))
-  for (col in extra_cols) out[[paste0("gwas_", col)]] <- gwas[[col]][gi]
+  add <- list()
+  for (col in extra_cols) add[[paste0("gwas_", col)]] <- gwas[[col]][gi]
 
-  out$match_status    <- qc$status
-  out$match_method    <- qc$match_method
-  out$usable          <- qc$usable
-  out$palindromic     <- qc$palindromic
-  out$strand_flipped  <- qc$strand_flipped
-  out$allele_flipped  <- qc$allele_flipped
-  out$ambiguous       <- qc$ambiguous
-  out$freq_mismatch   <- qc$freq_mismatch
-  out$freq_residual   <- qc$freq_residual
-  out$pos_shift       <- qc$pos_shift
-  out$n_gwas_matches  <- qc$n_target_matches
-
-  # Add the raw, unaligned GWAS values for matched variants. These are
-  # included in the matching engine's required columns, so they are not covered
-  # by the pass-through above, but can be useful for manual verification.
-  out$gwas_position_matched        <- gwas$position[gi]
-  out$gwas_effect_allele           <- gwas$effect_allele[gi]
-  out$gwas_other_allele            <- gwas$other_allele[gi]
-  out$gwas_beta                    <- gwas$beta[gi]
-  out$gwas_effect_allele_frequency <- gwas$effect_allele_frequency[gi]
-
-  # Align with the PGS effect allele. Betas and allele frequencies on rows with
-  # no resolved orientation get set to NA instead of being passed through.
-  # Columns are built by subset assignment rather than ifelse() so that they
-  # stay numeric even when nothing resolved.
-  raw_beta <- gwas$beta[gi]
-  raw_eaf  <- gwas$effect_allele_frequency[gi]
-  do_flip  <- !is.na(qc$allele_flipped) & qc$allele_flipped
+  # Align the beta with the PGS effect allele. Betas on rows with no resolved
+  # orientation get set to NA instead of being passed through. The column is
+  # built by subset assignment rather than ifelse() so that it stays numeric
+  # even when nothing resolved.
+  raw_beta     <- gwas$beta[gi]
+  do_flip      <- !is.na(qc$allele_flipped) & qc$allele_flipped
   beta_aligned <- raw_beta
-  eaf_aligned  <- raw_eaf
-  beta_aligned[do_flip] <- -raw_beta[do_flip]
-  eaf_aligned[do_flip]  <- 1 - raw_eaf[do_flip]
+  beta_aligned[do_flip]    <- -raw_beta[do_flip]
   beta_aligned[!qc$usable] <- NA_real_
-  eaf_aligned[!qc$usable]  <- NA_real_
-  out$gwas_beta_aligned                    <- beta_aligned
-  out$gwas_effect_allele_frequency_aligned <- eaf_aligned
+
+  # This function's own output. Assembled as a list and merged below rather than
+  # assigned one column at a time, so that the names it claims can be compared
+  # against the names already present instead of having to be restated in a
+  # hard-coded list that would drift as columns are added.
+  own <- list(
+    match_status   = qc$status,
+    match_method   = qc$match_method,
+    usable         = qc$usable,
+    palindromic    = qc$palindromic,
+    strand_flipped = qc$strand_flipped,
+    allele_flipped = qc$allele_flipped,
+    ambiguous      = qc$ambiguous,
+    freq_mismatch  = qc$freq_mismatch,
+    freq_residual  = qc$freq_residual,
+    pos_shift      = qc$pos_shift,
+    n_gwas_matches = qc$n_target_matches,
+    # The raw, unaligned GWAS values for matched variants. These are included in
+    # the matching engine's required columns, so they are not covered by the
+    # pass-through above, but can be useful for manual verification.
+    gwas_position_matched        = gwas$position[gi],
+    gwas_effect_allele           = gwas$effect_allele[gi],
+    gwas_other_allele            = gwas$other_allele[gi],
+    gwas_beta                    = gwas$beta[gi],
+    gwas_effect_allele_frequency = gwas$effect_allele_frequency[gi],
+    gwas_beta_aligned            = beta_aligned,
+    # The aligned frequency is exactly the flip match_variants() already applied
+    # to compute freq_residual, so it is taken from there rather than recomputed.
+    # That keeps one implementation of both the flip and the "NA where the
+    # orientation is unresolved" rule, and guarantees this column and the
+    # residual reported beside it can never disagree.
+    gwas_effect_allele_frequency_aligned = qc$target_freq_aligned
+  )
+
+  # Merge, with this function's own output taking precedence over a colliding
+  # pass-through column and over a colliding PGS column, and report both cases.
+  # own[] assigns in place where the name already exists and appends otherwise,
+  # so the column order is the pass-through block followed by the QC block.
+  .vm_warn_collisions(names(out), names(add), names(own), "pgs", "gwas")
+  add[names(own)] <- own
+  for (nm in names(add)) out[[nm]] <- add[[nm]]
 
   # Sort by chromosome and position, and then reset row names
   out <- out[.vm_order_rows(out$chromosome, out$position), , drop = FALSE]

@@ -22,10 +22,23 @@
 # strands? Meanwhile, `palindromic` answers, is this site palindromic?
 #
 # `ambiguous` denotes palindromic variants whose strand could not be confidently
-# resolved using frequency information, `freq_mismatch` denotes variants whose
-# harmonized effect allele frequencies are very different, and `pos_shift`
-# reports the number of base pairs that an indel had to be shifted in order to
-# find a match.
+# resolved using frequency information, and `freq_mismatch` denotes variants
+# whose harmonized effect allele frequencies are very different.
+#
+# `pos_shift` is the SIGNED number of base pairs that an indel had to be shifted
+# in order to find a match: the matched target position minus the query
+# position, both in trimmed coordinates. It is therefore 0 on the "exact" and
+# "trimmed" rungs, and non-zero only on "trimmed_window", where its sign says
+# which side of the query the matched target row sits on. It is NA exactly where
+# `usable` is FALSE. NOTE: this column is NUMERIC, not logical -- select shifted
+# rows with `pos_shift != 0`, never with `df[df$pos_shift, ]`, which would index
+# by row position instead of masking.
+#
+# `target_freq_aligned` is the target's effect allele frequency re-expressed for
+# the QUERY's effect allele (that is, 1 - f wherever `allele_flipped`), and is
+# the quantity `freq_residual` is computed from. It is exposed so that wrappers
+# needing an aligned frequency reuse this one rather than recomputing the same
+# flip against a second copy of the rule.
 #
 # `usable` is the overall flag meaning "orientation resolved". In practice,
 # downstream applications will often want to filter the output on
@@ -46,7 +59,7 @@
 #                    is the same 1 bp deletion as target 3000 CTT/CT.
 #   "trimmed_window" Same as "trimmed", but the trimmed positions differ by up
 #                    to indel_pos_tol. Must be unique or the row is refused.
-#                    Sets pos_shift.
+#                    Reports the offset in pos_shift.
 #
 # Why are the two trimmed rungs restricted to length-changing variants?
 #
@@ -116,10 +129,16 @@
 # "argument is not interpretable as logical" from deep inside the row loop, and
 # a nonsense threshold (say maf_ambig_thresh = 8 for "8%") silently marks every
 # palindromic variant ambiguous.
+#
+# An unbounded-above parameter is passed hi = Inf, but is.finite() still rejects
+# an actual Inf argument, so the range is phrased as ">= lo" in that case rather
+# than as "[lo, Inf]" -- which would name a value the check does not accept.
 .vm_chk_param <- function(x, what, lo, hi) {
   if (!is.numeric(x) || length(x) != 1L || !is.finite(x) || x < lo || x > hi)
-    stop(sprintf("%s must be a single finite number in [%g, %g]; got %s.",
-                 what, lo, hi, paste(utils::capture.output(dput(x)), collapse = "")),
+    stop(sprintf("%s must be a single finite number %s; got %s.", what,
+                 if (is.finite(hi)) sprintf("in [%g, %g]", lo, hi)
+                 else sprintf(">= %g", lo),
+                 paste(utils::capture.output(dput(x)), collapse = "")),
          call. = FALSE)
   x
 }
@@ -195,26 +214,37 @@
 # between the alleles (it removes the same count from both), so whether a
 # variant is length-changing is invariant under trimming.
 #
-# Vectorised over rows. The two loops advance only the rows still trimming, and
-# terminate after (min allele length - 1) iterations, which is 0 for the common
-# case of an indel padded with a single anchor base.
+# Vectorised over rows. `act` carries the indices of the rows STILL trimming and
+# shrinks on every iteration, so the total cost is the sum of the per-row trim
+# depths rather than (number of rows) x (depth of the deepest row). That
+# distinction is what stops one long allele from taxing every other row:
+# recomputing the comparison across the full vector each iteration made a single
+# 5 kb allele among 100k length-changing rows cost 16 s instead of 0.03 s, and a
+# 50 kb one cost 166 s. Panels that carry long indels or SVs (gnomAD, TOPMed,
+# HRC) hit this routinely. Each loop terminates after (min allele length - 1)
+# iterations, which is 0 for the common case of an indel padded with a single
+# anchor base.
 .vm_trim <- function(pos, a1, a2) {
   if (length(a1) == 0L) return(list(pos = pos, a1 = a1, a2 = a2))
   n1 <- nchar(a1); n2 <- nchar(a2)
-  k <- integer(length(a1))
+  k   <- integer(length(a1))
+  act <- seq_along(a1)
   repeat {
-    act <- (n1 - k) > 1L & (n2 - k) > 1L &
-           substring(a1, n1 - k, n1 - k) == substring(a2, n2 - k, n2 - k)
-    if (!any(act)) break
+    e1 <- n1[act] - k[act]; e2 <- n2[act] - k[act]
+    act <- act[e1 > 1L & e2 > 1L &
+               substring(a1[act], e1, e1) == substring(a2[act], e2, e2)]
+    if (length(act) == 0L) break
     k[act] <- k[act] + 1L
   }
   a1 <- substring(a1, 1L, n1 - k); a2 <- substring(a2, 1L, n2 - k)
   n1 <- n1 - k; n2 <- n2 - k
-  j <- integer(length(a1))
+  j   <- integer(length(a1))
+  act <- seq_along(a1)
   repeat {
-    act <- (n1 - j) > 1L & (n2 - j) > 1L &
-           substring(a1, j + 1L, j + 1L) == substring(a2, j + 1L, j + 1L)
-    if (!any(act)) break
+    s   <- j[act] + 1L
+    act <- act[(n1[act] - j[act]) > 1L & (n2[act] - j[act]) > 1L &
+               substring(a1[act], s, s) == substring(a2[act], s, s)]
+    if (length(act) == 0L) break
     j[act] <- j[act] + 1L
   }
   list(pos = pos + j, a1 = substring(a1, j + 1L), a2 = substring(a2, j + 1L))
@@ -228,6 +258,37 @@
 # from missing.
 .vm_bad_allele <- function(a) is.na(a) | !grepl("^[ACGT]+$", a)
 
+# Output-column collision reporting for the wrappers. Both build their result by
+# starting from the query table and assigning a fixed set of QC, raw-target and
+# derived columns over it, with the target's pass-through columns prefixed. Two
+# names can therefore be claimed twice, and in both cases the caller's data is
+# the copy that loses:
+#
+#   - a QUERY column sharing a name with an output column is replaced;
+#   - a TARGET pass-through column whose PREFIXED name collides with an output
+#     column is dropped (it is written first, then overwritten in place).
+#
+# The precedence itself is deliberate -- the function's own output has to win, or
+# the QC columns could not be trusted -- but it should not happen quietly. The
+# realistic trigger is re-running a wrapper on output it produced earlier, which
+# collides on every output column at once.
+.vm_warn_collisions <- function(query_names, passthrough_names, own_names,
+                                query_label, target_label) {
+  q <- function(x) paste(sprintf("`%s`", x), collapse = ", ")
+  displaced <- intersect(passthrough_names, own_names)
+  clobbered <- intersect(query_names, c(passthrough_names, own_names))
+  if (length(displaced) > 0L)
+    warning(sprintf(paste0("%s: pass-through column(s) %s collide with this function's ",
+                           "own output after prefixing and were dropped. Rename them in ",
+                           "%s to keep their values."),
+                    target_label, q(displaced), target_label), call. = FALSE)
+  if (length(clobbered) > 0L)
+    warning(sprintf(paste0("%s: column(s) %s share a name with this function's output ",
+                           "and were replaced. Rename them in %s to keep their values."),
+                    query_label, q(clobbered), query_label), call. = FALSE)
+  invisible(NULL)
+}
+
 
 # =============================================================================
 # match_variants()
@@ -235,8 +296,8 @@
 # Returns a list:
 #   $qc     data.frame, one row per query row (in query order), columns:
 #             status, match_method, palindromic, strand_flipped, allele_flipped,
-#             ambiguous, freq_mismatch, freq_residual, pos_shift,
-#             usable, n_target_matches, target_idx
+#             ambiguous, target_freq_aligned, freq_mismatch, freq_residual,
+#             pos_shift, usable, n_target_matches, target_idx
 #   $query  the query table with its shared columns coerced (character
 #           chromosome, numeric position, uppercase alleles, numeric frequency)
 #   $target the target table after dropping unusable rows, coerced the same
@@ -340,9 +401,15 @@ match_variants <- function(query, target,
   # are -- the trimmed rungs below would otherwise treat them as two competing
   # candidates for the same query row.
   #
-  # The cheap numeric key (chromosome index x 1e9 + position, exact in double
-  # for positions < 1e9) prefilters to co-located rows, so the expensive
-  # string paste only runs on that subset rather than on every panel row.
+  # The cheap numeric key (chromosome index x 1e9 + position) is a COLLISION-
+  # TOLERANT prefilter whose only job is to narrow the expensive string paste to
+  # co-located rows instead of running it on every panel row. Rows that really
+  # are co-located always hash equal, so no duplicate can be missed; a hash
+  # collision -- which happens once positions reach 1e9, where the chromosome
+  # and position fields start to alias, as they do on non-human assemblies --
+  # merely admits a few extra rows into the subset. The definitive key below is
+  # therefore built from the chromosome and position THEMSELVES rather than from
+  # the hash, so those extras cannot be reported as duplicates of one another.
   if (nrow(target) > 1L) {
     chr_i    <- match(t_chr_norm, unique(t_chr_norm))
     colocate <- chr_i * 1e9 + t_tr_pos
@@ -350,7 +417,7 @@ match_variants <- function(query, target,
     if (any(at_site)) {
       a1  <- pmin(t_tr_ea[at_site], t_tr_oa[at_site])
       a2  <- pmax(t_tr_ea[at_site], t_tr_oa[at_site])
-      key <- paste(colocate[at_site], a1, a2, sep = ":")
+      key <- paste(t_chr_norm[at_site], t_tr_pos[at_site], a1, a2, sep = ":")
       n_dup <- sum(duplicated(key))
       if (n_dup > 0L)
         warning(sprintf(paste0("%s: %d row(s) duplicate an earlier row's site and allele ",
@@ -368,7 +435,7 @@ match_variants <- function(query, target,
   strand_flipped <- rep(NA, n)
   allele_flipped <- rep(NA, n)
   ambiguous      <- rep(NA, n)
-  pos_shift      <- rep(NA, n)
+  pos_shift      <- rep(NA_real_, n)      # signed bp, 0 unless the window rung fired
   target_idx     <- rep(NA_integer_, n)
   n_matches      <- rep(NA_integer_, n)   # allele-compatible candidates seen
 
@@ -598,7 +665,7 @@ match_variants <- function(query, target,
       ambiguous[i]      <- FALSE
       status[i]         <- if (allele_flipped[i]) "allele_swap" else "match"
       match_method[i]   <- method
-      pos_shift[i]      <- via_window
+      pos_shift[i]      <- cmp_pos[k] - q_cmp_pos
       target_idx[i]     <- k
       next
     }
@@ -665,7 +732,7 @@ match_variants <- function(query, target,
 
     status[i]       <- if (allele_flipped[i]) "allele_swap" else "match"
     match_method[i] <- method
-    pos_shift[i]    <- via_window
+    pos_shift[i]    <- cmp_pos[k] - q_cmp_pos
     target_idx[i]   <- k
   }
 
@@ -679,6 +746,12 @@ match_variants <- function(query, target,
   # For palindromic rows this reproduces exactly the winning orientation's
   # distance, min(d_same, d_flip): the orientation was chosen to minimise it,
   # so aligning by the chosen allele_flipped recovers the same number.
+  #
+  # `aligned` is returned as target_freq_aligned rather than kept local, because
+  # a wrapper that needs the target's frequency stated for the query's effect
+  # allele needs precisely this vector. Recomputing it wrapper-side duplicates
+  # both the flip and the NA rule, and lets the wrapper's copy drift out of step
+  # with the residual reported next to it.
   # ---------------------------------------------------------------------------
   t_freq_raw <- target$effect_allele_frequency[target_idx]
   aligned    <- t_freq_raw
@@ -718,19 +791,20 @@ match_variants <- function(query, target,
 
   list(
     qc = data.frame(
-      status           = status,
-      match_method     = match_method,
-      palindromic      = palindromic,
-      strand_flipped   = strand_flipped,
-      allele_flipped   = allele_flipped,
-      ambiguous        = ambiguous,
-      freq_mismatch    = freq_mismatch,
-      freq_residual    = freq_residual,
-      pos_shift        = pos_shift,
-      usable           = usable,
-      n_target_matches = n_matches,
-      target_idx       = target_idx,
-      stringsAsFactors = FALSE
+      status              = status,
+      match_method        = match_method,
+      palindromic         = palindromic,
+      strand_flipped      = strand_flipped,
+      allele_flipped      = allele_flipped,
+      ambiguous           = ambiguous,
+      target_freq_aligned = aligned,
+      freq_mismatch       = freq_mismatch,
+      freq_residual       = freq_residual,
+      pos_shift           = pos_shift,
+      usable              = usable,
+      n_target_matches    = n_matches,
+      target_idx          = target_idx,
+      stringsAsFactors    = FALSE
     ),
     query  = query,
     target = target

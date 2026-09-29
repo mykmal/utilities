@@ -14,6 +14,9 @@
 #   allele_flipped, ambiguous, freq_mismatch, freq_residual, pos_shift,
 #   n_ref_matches
 #
+# pos_shift is NUMERIC (signed base pairs, 0 unless the window rung fired), so
+# select shifted rows with `pos_shift != 0` rather than treating it as a flag.
+#
 # match_method records which rung of the matching ladder resolved the row:
 #   "exact" (verbatim alleles match at the exact position),
 #   "trimmed" (parsimonious indel representations agree at the exact position),
@@ -24,8 +27,14 @@
 #   ref_effect_allele_frequency
 #
 # Scoring columns:
-#   harmonized_effect_allele, harmonized_other_allele, harmonized_weight,
-#   harmonized_freq
+#   harmonized_effect_allele, harmonized_other_allele, harmonized_weight
+#
+# No harmonized frequency column is emitted. This wrapper never re-signs a
+# weight, so such a column could only restate a frequency the caller already
+# has: the PGS's own effect_allele_frequency (unchanged, since it already refers
+# to the PGS effect allele) or ref_effect_allele_frequency flipped wherever
+# allele_flipped. Callers wanting the latter can take it from match_variants()'s
+# target_freq_aligned directly.
 # =============================================================================
 harmonize_pgs <- function(pgs, ref,
                           indel_pos_tol       = 1,
@@ -51,32 +60,36 @@ harmonize_pgs <- function(pgs, ref,
   out <- pgs
 
   # Pass through any other reference columns (rsid, INFO score, ...) verbatim;
-  # these aren't orientation-dependent so no flip is applicable. They are
-  # assigned before the columns below so that a reference column whose name
-  # collides after prefixing (e.g., a ref column named "position_matched")
-  # cannot overwrite this function's own QC output.
+  # these aren't orientation-dependent so no flip is applicable.
   extra_cols <- setdiff(names(ref), .VM_REQ_COLS)
-  for (col in extra_cols) out[[paste0("ref_", col)]] <- ref[[col]][ri]
+  add <- list()
+  for (col in extra_cols) add[[paste0("ref_", col)]] <- ref[[col]][ri]
 
-  out$match_status    <- qc$status
-  out$match_method    <- qc$match_method
-  out$usable          <- qc$usable
-  out$palindromic     <- qc$palindromic
-  out$strand_flipped  <- qc$strand_flipped
-  out$allele_flipped  <- qc$allele_flipped
-  out$ambiguous       <- qc$ambiguous
-  out$freq_mismatch   <- qc$freq_mismatch
-  out$freq_residual   <- qc$freq_residual
-  out$pos_shift       <- qc$pos_shift
-  out$n_ref_matches   <- qc$n_target_matches
-
-  # Add the raw, unaligned reference values for matched variants. These are
-  # included in the matching engine's required columns, so they are not covered
-  # by the pass-through above, but can be useful for manual verification.
-  out$ref_position_matched         <- ref$position[ri]
-  out$ref_effect_allele            <- ref$effect_allele[ri]
-  out$ref_other_allele             <- ref$other_allele[ri]
-  out$ref_effect_allele_frequency  <- ref$effect_allele_frequency[ri]
+  # This function's own output. Assembled as a list and merged below rather than
+  # assigned one column at a time, so that the names it claims can be compared
+  # against the names already present instead of having to be restated in a
+  # hard-coded list that would drift as columns are added.
+  own <- list(
+    match_status   = qc$status,
+    match_method   = qc$match_method,
+    usable         = qc$usable,
+    palindromic    = qc$palindromic,
+    strand_flipped = qc$strand_flipped,
+    allele_flipped = qc$allele_flipped,
+    ambiguous      = qc$ambiguous,
+    freq_mismatch  = qc$freq_mismatch,
+    freq_residual  = qc$freq_residual,
+    pos_shift      = qc$pos_shift,
+    n_ref_matches  = qc$n_target_matches,
+    # The raw, unaligned reference values for matched variants. These are
+    # included in the matching engine's required columns, so they are not
+    # covered by the pass-through above, but can be useful for manual
+    # verification.
+    ref_position_matched        = ref$position[ri],
+    ref_effect_allele           = ref$effect_allele[ri],
+    ref_other_allele            = ref$other_allele[ri],
+    ref_effect_allele_frequency = ref$effect_allele_frequency[ri]
+  )
 
   # Only allele letters are changed, and only where the reference codes the site
   # on the opposite strand from the PGS. plink2 --score identifies the effect
@@ -99,14 +112,20 @@ harmonize_pgs <- function(pgs, ref,
   hm_oa <- roa_v; hm_oa[swap] <- rea_v[swap]
   hm_ea[is.na(qc$allele_flipped)] <- NA_character_
   hm_oa[is.na(qc$allele_flipped)] <- NA_character_
-  out$harmonized_effect_allele <- hm_ea
-  out$harmonized_other_allele  <- hm_oa
+  own$harmonized_effect_allele <- hm_ea
+  own$harmonized_other_allele  <- hm_oa
 
-  # The weight and frequency on unusable rows get an NA too
-  w <- pgs$effect_weight;             w[!qc$usable] <- NA_real_
-  f <- pgs$effect_allele_frequency;   f[!qc$usable] <- NA_real_
-  out$harmonized_weight <- w
-  out$harmonized_freq   <- f
+  # The weight on unusable rows gets an NA too
+  w <- pgs$effect_weight; w[!qc$usable] <- NA_real_
+  own$harmonized_weight <- w
+
+  # Merge, with this function's own output taking precedence over a colliding
+  # pass-through column and over a colliding PGS column, and report both cases.
+  # own[] assigns in place where the name already exists and appends otherwise,
+  # so the column order is the pass-through block followed by the QC block.
+  .vm_warn_collisions(names(out), names(add), names(own), "pgs", "ref")
+  add[names(own)] <- own
+  for (nm in names(add)) out[[nm]] <- add[[nm]]
 
   # Sort by chromosome and position, and then reset row names
   out <- out[.vm_order_rows(out$chromosome, out$position), , drop = FALSE]
